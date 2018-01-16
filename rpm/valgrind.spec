@@ -57,7 +57,7 @@ Requires: valgrind = %{version}-%{release}
 %define debug_package %{nil}
 
 %prep
-%setup -q -n %{name}-%{version}/%{name}
+%setup -q -n %{name}-%{version}
 
 %build
 
