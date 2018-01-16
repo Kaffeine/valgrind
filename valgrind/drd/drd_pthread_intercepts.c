@@ -5,7 +5,7 @@
 /*
   This file is part of DRD, a thread error detector.
 
-  Copyright (C) 2006-2015 Bart Van Assche <bvanassche@acm.org>.
+  Copyright (C) 2006-2017 Bart Van Assche <bvanassche@acm.org>.
 
   This program is free software; you can redistribute it and/or
   modify it under the terms of the GNU General Public License as
@@ -55,13 +55,6 @@
 #include <stdlib.h>         /* malloc(), free() */
 #include <unistd.h>         /* confstr() */
 #include "config.h"         /* HAVE_PTHREAD_MUTEX_ADAPTIVE_NP etc. */
-#ifdef HAVE_USABLE_LINUX_FUTEX_H
-#include <asm/unistd.h>     /* __NR_futex */
-#include <linux/futex.h>    /* FUTEX_WAIT */
-#ifndef FUTEX_PRIVATE_FLAG
-#define FUTEX_PRIVATE_FLAG 0
-#endif
-#endif
 #include "drd_basics.h"     /* DRD_() */
 #include "drd_clientreq.h"
 #include "pub_tool_redir.h" /* VG_WRAP_FUNCTION_ZZ() */
@@ -218,8 +211,8 @@ static int never_true;
 
 typedef struct {
    pthread_mutex_t mutex;
+   pthread_cond_t cond;
    int counter;
-   int waiters;
 } DrdSema;
 
 typedef struct
@@ -235,7 +228,7 @@ typedef struct
 
 static void DRD_(init)(void) __attribute__((constructor));
 static void DRD_(check_threading_library)(void);
-static void DRD_(set_main_thread_state)(void);
+static void DRD_(set_pthread_id)(void);
 static void DRD_(sema_init)(DrdSema* sema);
 static void DRD_(sema_destroy)(DrdSema* sema);
 static void DRD_(sema_down)(DrdSema* sema);
@@ -257,7 +250,7 @@ static void DRD_(sema_up)(DrdSema* sema);
 static void DRD_(init)(void)
 {
    DRD_(check_threading_library)();
-   DRD_(set_main_thread_state)();
+   DRD_(set_pthread_id)();
 #if defined(VGO_solaris)
    if ((DRD_(rtld_bind_guard) == NULL) || (DRD_(rtld_bind_clear) == NULL)) {
       fprintf(stderr,
@@ -280,43 +273,21 @@ static void DRD_(sema_init)(DrdSema* sema)
    DRD_IGNORE_VAR(*sema);
    pthread_mutex_init(&sema->mutex, NULL);
    DRD_(ignore_mutex_ordering)(&sema->mutex);
+   pthread_cond_init(&sema->cond, NULL);
    sema->counter = 0;
-   sema->waiters = 0;
 }
 
 static void DRD_(sema_destroy)(DrdSema* sema)
 {
    pthread_mutex_destroy(&sema->mutex);
+   pthread_cond_destroy(&sema->cond);
 }
 
 static void DRD_(sema_down)(DrdSema* sema)
 {
-   int res = ENOSYS;
-
    pthread_mutex_lock(&sema->mutex);
-   if (sema->counter == 0) {
-      sema->waiters++;
-      while (sema->counter == 0) {
-         pthread_mutex_unlock(&sema->mutex);
-#ifdef HAVE_USABLE_LINUX_FUTEX_H
-         if (syscall(__NR_futex, (UWord)&sema->counter,
-                     FUTEX_WAIT | FUTEX_PRIVATE_FLAG, 0) == 0)
-            res = 0;
-         else
-            res = errno;
-#endif
-         /*
-          * Invoke sched_yield() on non-Linux systems, if the futex syscall has
-          * not been invoked or if this code has been built on a Linux system
-          * where __NR_futex is defined and is run on a Linux system that does
-          * not support the futex syscall.
-          */
-         if (res != 0 && res != EWOULDBLOCK)
-            sched_yield();
-         pthread_mutex_lock(&sema->mutex);
-      }
-      sema->waiters--;
-   }
+   while (sema->counter == 0)
+      pthread_cond_wait(&sema->cond, &sema->mutex);
    sema->counter--;
    pthread_mutex_unlock(&sema->mutex);
 }
@@ -325,11 +296,7 @@ static void DRD_(sema_up)(DrdSema* sema)
 {
    pthread_mutex_lock(&sema->mutex);
    sema->counter++;
-#ifdef HAVE_USABLE_LINUX_FUTEX_H
-   if (sema->waiters > 0)
-      syscall(__NR_futex, (UWord)&sema->counter,
-              FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1);
-#endif
+   pthread_cond_signal(&sema->cond);
    pthread_mutex_unlock(&sema->mutex);
 }
 
@@ -534,12 +501,10 @@ static void DRD_(check_threading_library)(void)
 }
 
 /**
- * The main thread is the only thread not created by pthread_create().
- * Update DRD's state information about the main thread.
+ * Update DRD's state information about the current thread.
  */
-static void DRD_(set_main_thread_state)(void)
+static void DRD_(set_pthread_id)(void)
 {
-   // Make sure that DRD knows about the main thread's POSIX thread ID.
    VALGRIND_DO_CLIENT_REQUEST_STMT(VG_USERREQ__SET_PTHREADID,
                                    pthread_self(), 0, 0, 0, 0);
 }
@@ -591,6 +556,14 @@ int pthread_create_intercept(pthread_t* thread, const pthread_attr_t* attr,
    assert(thread_args.detachstate == PTHREAD_CREATE_JOINABLE
           || thread_args.detachstate == PTHREAD_CREATE_DETACHED);
 
+   /*
+    * The DRD_(set_pthread_id)() from DRD_(init)() may encounter that
+    * pthread_self() == 0, e.g. when the main program is not linked with the
+    * pthread library and when a pthread_create() call occurs from within a
+    * shared library. Hence call DRD_(set_pthread_id)() again to ensure that
+    * DRD knows the identity of the current thread. See also B.Z. 356374.
+    */
+   DRD_(set_pthread_id)();
    DRD_(entering_pthread_create)();
    CALL_FN_W_WWWW(ret, fn, thread, attr, DRD_(thread_wrapper), &thread_args);
    DRD_(left_pthread_create)();
