@@ -70,6 +70,8 @@ RPM_OPT_FLAGS="`echo " $RPM_OPT_FLAGS " | sed 's/ -mthumb / /g'`"
 
 export CFLAGS="$RPM_OPT_FLAGS"
 export CXXFLAGS="$RPM_OPT_FLAGS"
+pwd
+ls
 autoreconf -fi
 export GDB=/usr/bin/gdb
 
